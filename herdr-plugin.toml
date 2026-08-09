@@ -3,27 +3,71 @@ name = "Cache TTL Countdown"
 version = "0.3.2"
 min_herdr_version = "0.7.5"
 description = "Live prompt-cache countdown per agent pane"
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 
 # Select the prebuilt binary for this host at install time. No toolchain
 # required on the target — dist/ ships one artifact per platform.
 [[build]]
 command = ["sh", "-c", "cp \"dist/cache-ttl-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)\" cache-ttl && chmod +x cache-ttl"]
+platforms = ["linux", "macos"]
+
+# dist/ ships no windows artifact; compile from source instead. Lands at
+# target\release\cache-ttl.exe (standard cargo layout), NOT plugin-root
+# .\cache-ttl like the unix build above — every windows launcher below
+# points at that path explicitly.
+[[build]]
+command = ["cargo", "build", "--release"]
+platforms = ["windows"]
 
 [[startup]]
 command = ["./cache-ttl", "daemon"]
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') daemon"
+]
+platforms = ["windows"]
 
 [[events]]
 on = "pane.agent_status_changed"
 command = ["./cache-ttl", "on-status-change"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') on-status-change"
+]
+platforms = ["windows"]
 
 [[events]]
 on = "pane.closed"
 command = ["./cache-ttl", "on-pane-closed"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.closed"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') on-pane-closed"
+]
+platforms = ["windows"]
 
 [[events]]
 on = "pane.exited"
 command = ["./cache-ttl", "on-pane-closed"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.exited"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') on-pane-closed"
+]
+platforms = ["windows"]
 
 [[actions]]
 id = "reset"
@@ -31,6 +75,18 @@ title = "Reset cache timer"
 description = "Reset the cache TTL countdown for the focused pane"
 contexts = ["pane"]
 command = ["./cache-ttl", "reset-timer"]
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "reset-win"
+title = "Reset cache timer"
+description = "Reset the cache TTL countdown for the focused pane"
+contexts = ["pane"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') reset-timer"
+]
+platforms = ["windows"]
 
 [[actions]]
 id = "status"
@@ -38,6 +94,18 @@ title = "Show cache timers"
 description = "Print all active cache TTL timers"
 contexts = ["workspace"]
 command = ["./cache-ttl", "show-timers"]
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "status-win"
+title = "Show cache timers"
+description = "Print all active cache TTL timers"
+contexts = ["workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') show-timers"
+]
+platforms = ["windows"]
 
 [[actions]]
 id = "sort"
@@ -45,3 +113,15 @@ title = "Toggle cache sort"
 description = "Sort agent panel by cache TTL urgency"
 contexts = ["workspace"]
 command = ["./cache-ttl", "toggle-sort"]
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "sort-win"
+title = "Toggle cache sort"
+description = "Sort agent panel by cache TTL urgency"
+contexts = ["workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "$r=$env:HERDR_PLUGIN_ROOT; if($r.StartsWith('\\\\?\\')){$r=$r.Substring(4)}; & (Join-Path $r 'target\\release\\cache-ttl.exe') toggle-sort"
+]
+platforms = ["windows"]
