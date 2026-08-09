@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0
+
+- Add Windows support (`platforms = ["linux", "macos", "windows"]`) — compiles
+  from source via a `[[build]]` `cargo build --release` hook (no prebuilt
+  `dist/` artifact for this platform); every manifest entry gets a
+  `-win`-suffixed startup/event/action variant that launches
+  `target\release\cache-ttl.exe` through a PowerShell wrapper resolving
+  `HERDR_PLUGIN_ROOT`
+- Windows socket transport: `socket_send` writes to the named pipe
+  `\\.\pipe\<HERDR_SOCKET_PATH>` (`CreateFileW` + `WriteFile`, with an
+  `ERROR_PIPE_BUSY` retry) so `sort-win` and daemon-startup sort reapplication
+  reach herdr the same way the Unix `UnixStream` path does
+  (`toggle_sort`/`sort`/`sort-win` and `reapply_sort` are the only callers)
+- Windows state lock: `LockFileEx`/`UnlockFileEx` replace `flock` as the
+  cross-process exclusive lock guarding `timers.json`/`notified.json`
+- Windows daemon liveness hardening: pid-file liveness now also confirms the
+  pid's image name ends in `cache-ttl.exe` via `QueryFullProcessImageNameW`,
+  so a recycled Windows pid can no longer be mistaken for a live daemon (a
+  stale pid file now self-heals on next start instead of blocking the daemon
+  forever); the tick loop also now gives up and exits cleanly after 10
+  consecutive failed ticks instead of spinning forever against a permanently
+  unreachable herdr server (applies to both platforms)
+- Windows named-pipe write now checks `WriteFile`'s byte count and errors on
+  a partial write instead of always returning success
+
 ## 0.3.2
 
 - Resolve the herdr binary via `HERDR_BIN_PATH` instead of bare `herdr` on
