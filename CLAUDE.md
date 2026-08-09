@@ -28,14 +28,16 @@ countdown per agent pane).
   `#[cfg(unix)]`. `libc` is `[target.'cfg(unix)']`; `windows-sys` is
   `[target.'cfg(windows)']`.
 
-## herdr integration (learned porting this plugin — verified on herdr
-0.8.0-preview.2026-08-04-d78e3d3b5126)
+## herdr integration (learned porting this plugin — verified on herdr 0.8.0-preview.2026-08-04-d78e3d3b5126)
 
-- **Socket transport (`sort`/`status` actions):** `HERDR_SOCKET_PATH` is a
-  filesystem-style path; the real Windows endpoint is the named pipe
-  `\\.\pipe\` + that path. `socket_send` only ever writes one line and
-  returns, so the Windows implementation is a plain `CreateFileW` +
-  `WriteFile`, not a full duplex transport.
+- **Socket transport (`sort`/`sort-win` actions only):** `show_timers`
+  (`status`/`status-win`) never touches the socket — only
+  `toggle_sort`/`sort`/`sort-win` and the daemon's `reapply_sort` call
+  `socket_send`. `HERDR_SOCKET_PATH` is a filesystem-style path; the real
+  Windows endpoint is the named pipe `\\.\pipe\` + that path. `socket_send`
+  only ever writes one line and returns, so the Windows implementation is a
+  plain `CreateFileW` + `WriteFile`, not a full duplex transport, and has no
+  write timeout (see gaps below).
 - **Manifest command spawn (Windows):** herdr runs commands with an
   extended-length `\\?\C:\..` cwd; `CreateProcessW` can't resolve a relative
   `./cache-ttl` exe against it. Windows manifest entries go through a
@@ -102,6 +104,25 @@ countdown per agent pane).
   event twins were not exercised live in this pass — their PowerShell launcher
   is byte-identical in shape to the startup/action launchers that *were*
   confirmed working, so risk is judged low, but it is an honest gap.
+- **Not exercised — Windows `[[build]]` via herdr's own install/build flow.**
+  The `cargo build --release` `[[build]]` entry has never actually been
+  triggered by herdr's plugin-install/build machinery; the binary so far has
+  only ever been built by hand (`cargo build --release` run directly). This
+  assumes `cargo` is on the herdr server process's PATH (not just the
+  interactive shell's) and that no `CARGO_TARGET_DIR` env var is redirecting
+  build output away from `target\release` — every Windows launcher above
+  hardcodes that exact path.
+- **Not exercised — cross-process file-lock contention.** The Windows
+  `LockFileEx`/`UnlockFileEx` state lock (`src/state.rs`) has only been
+  proven to round-trip acquire+drop within a single process
+  (`lock_is_exclusive_within_one_process`); two real `cache-ttl` invocations
+  actually racing a save has not been run live on either platform. Known
+  gap, not attempted in this pass.
+- **Known limitation — Windows `socket_send` has no write timeout.** Unlike
+  the Unix path's `set_write_timeout(2s)`, the named-pipe `WriteFile` has no
+  timeout, so a stalled herdr reader could block `reapply_sort` indefinitely
+  at daemon startup. Fixing this needs overlapped I/O; deferred as
+  out-of-scope for a cheap fix.
 
 ## Layout
 
