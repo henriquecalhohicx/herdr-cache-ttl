@@ -56,6 +56,20 @@ pub fn run(cfg: &Config) -> io::Result<()> {
     let cleanup_interval = 10;
     let mut tick_count = 0u64;
     let mut consecutive_failures = 0;
+    // Bounded exit after prolonged total failure. 3 consecutive failed ticks
+    // already trigger the 60s backoff below; that alone never stops the
+    // loop, so a permanently unreachable herdr server previously meant an
+    // unkillable-by-normal-means daemon spinning forever on both platforms
+    // (Windows especially, since a hard kill can't be caught at all — see
+    // the pid-file comment above). 10 is chosen so a few consecutive
+    // failures caused by a transient blip (server restart, brief network
+    // hiccup) don't shut the daemon down — by the 10th failure at least
+    // (10 - 3) * 60s = 7 minutes have passed with every tick still failing,
+    // which is long past "transient". This mirrors
+    // `herdr-pc-ram-and-cpu-usage-overlay`'s daemon shutting down after five
+    // consecutive failures, just tuned to this daemon's shorter tick
+    // interval and its separate 60s backoff step.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 10;
 
     while RUNNING.load(Ordering::Relaxed) {
         thread::sleep(tick_dur);
@@ -104,6 +118,12 @@ pub fn run(cfg: &Config) -> io::Result<()> {
 
         if failed > 0 && updated == 0 {
             consecutive_failures += 1;
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                logf(&format!(
+                    "giving up after {consecutive_failures} consecutive failed ticks (herdr server likely gone), shutting down: {last_err}"
+                ));
+                return Ok(());
+            }
             if consecutive_failures >= 3 {
                 logf(&format!(
                     "all updates failing ({consecutive_failures} consecutive), backing off: {last_err}"
@@ -214,6 +234,19 @@ fn pid_alive(pid: i32) -> bool {
 /// `herdr-pc-ram-and-cpu-usage-overlay`'s `pid_alive` already uses. `pid <=
 /// 0` is rejected up front: 0 is the Windows System Idle Process pid, and a
 /// corrupted/zero pid-file entry must not be reported as a live daemon.
+///
+/// Beyond that: there is no signal handler on Windows (see the comment in
+/// `run` above), so a hard kill — which is how herdr always terminates a
+/// plugin process on this platform — never runs `PidGuard::drop`, and
+/// `daemon.pid` survives with a dead pid in it. Windows recycles pids, so a
+/// live-but-unrelated process can later reuse that exact pid, and the
+/// `STILL_ACTIVE` check above alone would then report a false positive
+/// forever (no daemon ever restarts, since `run` exits early believing one
+/// is already up). Guard against that by also checking, via
+/// `QueryFullProcessImageNameW`, that the pid actually belongs to a
+/// `cache-ttl.exe` — a match makes it genuinely alive, a mismatch (or a
+/// failure to even read the image name) makes the pid file self-heal on the
+/// next daemon start, since `run` then proceeds instead of exiting.
 #[cfg(windows)]
 fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
@@ -221,7 +254,8 @@ fn pid_alive(pid: i32) -> bool {
     }
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
     // SAFETY: handle checked before use; code is caller-owned; handle closed
     // exactly once.
@@ -231,10 +265,31 @@ fn pid_alive(pid: i32) -> bool {
             return false;
         }
         let mut code: u32 = 0;
-        let ok = GetExitCodeProcess(h, &mut code);
+        let exit_ok = GetExitCodeProcess(h, &mut code);
+        if exit_ok == 0 || code != STILL_ACTIVE as u32 {
+            CloseHandle(h);
+            return false;
+        }
+
+        let mut name_buf = [0u16; 260]; // MAX_PATH
+        let mut name_len = name_buf.len() as u32;
+        let name_ok =
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, name_buf.as_mut_ptr(), &mut name_len);
         CloseHandle(h);
-        ok != 0 && code == STILL_ACTIVE as u32
+        if name_ok == 0 {
+            return false;
+        }
+        let image_path = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+        is_cache_ttl_image(&image_path)
     }
+}
+
+/// Pure suffix check behind the pid-recycling guard above, split out for
+/// unit testing without a real process handle. Case-insensitive: Windows
+/// image paths are case-preserving but not case-sensitive.
+#[cfg(windows)]
+fn is_cache_ttl_image(image_path: &str) -> bool {
+    image_path.to_ascii_lowercase().ends_with("cache-ttl.exe")
 }
 
 fn logf(msg: &str) {
@@ -277,11 +332,42 @@ mod tests {
         assert!(!is_running(&path));
     }
 
+    // Unix `pid_alive` is a plain `kill(pid, 0)` liveness probe with no
+    // image-name check, so testing it against the current (test-harness)
+    // process's own pid is valid there.
+    #[cfg(unix)]
     #[test]
     fn is_running_true_for_the_current_process() {
         let path = std::env::temp_dir().join(format!("cache-ttl-self-pid-{}", std::process::id()));
         std::fs::write(&path, format!("{}", std::process::id())).unwrap();
         assert!(is_running(&path));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Windows `pid_alive` additionally requires the pid's image name to end
+    // in `cache-ttl.exe` (see the pid-recycling comment above `pid_alive`),
+    // so the current process — the `cargo test` harness binary, not
+    // `cache-ttl.exe` — must correctly read as NOT running even though it is
+    // very much alive. This exercises the real `QueryFullProcessImageNameW`
+    // path against a real, live process without needing to build/spawn the
+    // actual `cache-ttl.exe` binary.
+    #[cfg(windows)]
+    #[test]
+    fn is_running_false_for_the_current_process_wrong_image_name() {
+        let path = std::env::temp_dir().join(format!("cache-ttl-self-pid-{}", std::process::id()));
+        std::fs::write(&path, format!("{}", std::process::id())).unwrap();
+        assert!(!is_running(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_cache_ttl_image_matches_case_insensitively_and_rejects_others() {
+        assert!(is_cache_ttl_image(
+            r"C:\plugins\cache-ttl\target\release\cache-ttl.exe"
+        ));
+        assert!(is_cache_ttl_image(r"C:\Plugins\Cache-Ttl.EXE"));
+        assert!(!is_cache_ttl_image(r"C:\Windows\System32\notepad.exe"));
+        assert!(!is_cache_ttl_image(""));
     }
 }
