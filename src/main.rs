@@ -1,11 +1,7 @@
 mod config;
-#[cfg(unix)]
 mod daemon;
-#[cfg(unix)]
 mod handlers;
-#[cfg(unix)]
 mod herdr;
-#[cfg(unix)]
 mod state;
 
 use std::process;
@@ -30,7 +26,6 @@ mod tests {
     }
 }
 
-#[cfg(unix)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -64,10 +59,4 @@ fn main() {
         eprintln!("{e}");
         process::exit(1);
     }
-}
-
-#[cfg(windows)]
-fn main() {
-    eprintln!("cache-ttl is not yet supported on Windows");
-    process::exit(1);
 }
