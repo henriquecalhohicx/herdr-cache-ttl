@@ -197,9 +197,6 @@ fn is_running(pid_file: &std::path::Path) -> bool {
     let Ok(pid) = data.trim().parse::<i32>() else {
         return false;
     };
-    if pid <= 0 {
-        return false;
-    }
     pid_alive(pid)
 }
 
@@ -214,9 +211,14 @@ fn pid_alive(pid: i32) -> bool {
 /// succeeding is not by itself proof of liveness (a pid can be reused, or
 /// the handle can briefly outlive process exit), so this also checks
 /// `GetExitCodeProcess` returns `STILL_ACTIVE` — the same two-step check
-/// `herdr-pc-ram-and-cpu-usage-overlay`'s `pid_alive` already uses.
+/// `herdr-pc-ram-and-cpu-usage-overlay`'s `pid_alive` already uses. `pid <=
+/// 0` is rejected up front: 0 is the Windows System Idle Process pid, and a
+/// corrupted/zero pid-file entry must not be reported as a live daemon.
 #[cfg(windows)]
 fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
