@@ -1,8 +1,10 @@
 use serde::Deserialize;
-use std::io::{self, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
 use std::process::Command;
 use std::sync::OnceLock;
+#[cfg(unix)]
 use std::time::Duration;
 
 use crate::config::Config;
@@ -55,13 +57,34 @@ pub fn set_pane_tokens(pane_id: &str, remaining: i64, cfg: &Config) -> io::Resul
     let tier_token;
     if remaining <= cfg.crit_at {
         tier_token = format!("cache_crit={label}");
-        args.extend(["--token", &tier_token, "--clear-token", "cache_ok", "--clear-token", "cache_warn"]);
+        args.extend([
+            "--token",
+            &tier_token,
+            "--clear-token",
+            "cache_ok",
+            "--clear-token",
+            "cache_warn",
+        ]);
     } else if remaining <= cfg.warn_at {
         tier_token = format!("cache_warn={label}");
-        args.extend(["--token", &tier_token, "--clear-token", "cache_ok", "--clear-token", "cache_crit"]);
+        args.extend([
+            "--token",
+            &tier_token,
+            "--clear-token",
+            "cache_ok",
+            "--clear-token",
+            "cache_crit",
+        ]);
     } else {
         tier_token = format!("cache_ok={label}");
-        args.extend(["--token", &tier_token, "--clear-token", "cache_warn", "--clear-token", "cache_crit"]);
+        args.extend([
+            "--token",
+            &tier_token,
+            "--clear-token",
+            "cache_warn",
+            "--clear-token",
+            "cache_crit",
+        ]);
     }
 
     let out = Command::new(herdr_bin()).args(&args).output()?;
@@ -78,13 +101,16 @@ pub fn set_pane_tokens(pane_id: &str, remaining: i64, cfg: &Config) -> io::Resul
 
 pub fn agent_list() -> io::Result<Vec<AgentInfo>> {
     let out = Command::new(herdr_bin()).args(["agent", "list"]).output()?;
-    let resp: AgentListResp =
-        serde_json::from_slice(&out.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let resp: AgentListResp = serde_json::from_slice(&out.stdout)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(resp.result.agents)
 }
 
 pub fn agent_get_title(pane_id: &str) -> String {
-    let Ok(out) = Command::new(herdr_bin()).args(["agent", "get", pane_id]).output() else {
+    let Ok(out) = Command::new(herdr_bin())
+        .args(["agent", "get", pane_id])
+        .output()
+    else {
         return pane_id.to_string();
     };
     let Ok(resp) = serde_json::from_slice::<AgentGetResp>(&out.stdout) else {
@@ -100,15 +126,108 @@ pub fn agent_get_title(pane_id: &str) -> String {
 
 pub fn notify(title: &str, body: &str, sound: &str) {
     let _ = Command::new(herdr_bin())
-        .args(["notification", "show", title, "--body", body, "--sound", sound])
+        .args([
+            "notification",
+            "show",
+            title,
+            "--body",
+            body,
+            "--sound",
+            sound,
+        ])
         .output();
 }
 
+#[cfg(unix)]
 pub fn socket_send(socket_path: &str, msg: &str) -> io::Result<()> {
+    use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket_path)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     writeln!(stream, "{msg}")?;
     Ok(())
+}
+
+/// Windows: herdr injects `HERDR_SOCKET_PATH` as a filesystem-style path
+/// (alongside a placeholder file of that name), but the real Windows IPC
+/// endpoint is the named pipe `\\.\pipe\<that path>` — opening the bare path
+/// lands on the placeholder and fails with a sharing violation (verified
+/// independently in the `herdr-pc-ram-and-cpu-usage-overlay` fork against
+/// live herdr 0.7.4). `socket_send` only ever writes one line and returns —
+/// it never reads a response — so this is a plain `CreateFileW` + one
+/// `WriteFile`, with the same `ERROR_PIPE_BUSY` retry the overlay fork's
+/// richer transport uses for its connect path.
+#[cfg(windows)]
+pub fn socket_send(socket_path: &str, msg: &str) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, WriteFile, OPEN_EXISTING};
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    let wide = to_wide(&pipe_name_str(socket_path));
+    let handle = loop {
+        // SAFETY: wide is NUL-terminated; the returned handle is checked
+        // before use and closed exactly once below.
+        let h = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if h != INVALID_HANDLE_VALUE && !h.is_null() {
+            break h;
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
+            // SAFETY: wide is NUL-terminated.
+            if unsafe { WaitNamedPipeW(wide.as_ptr(), 15_000) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            continue;
+        }
+        return Err(err);
+    };
+
+    let line = format!("{msg}\n");
+    let bytes = line.as_bytes();
+    let mut written: u32 = 0;
+    // SAFETY: bytes is valid for bytes.len(); written is caller-owned;
+    // handle is closed in the guard below regardless of the outcome.
+    let ok = unsafe {
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: handle came from CreateFileW above and is closed exactly once.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Pure prefix logic behind the Windows `socket_send`, split out for unit
+/// testing without touching a real pipe.
+#[cfg(windows)]
+fn pipe_name_str(raw: &str) -> String {
+    if raw.starts_with(r"\\.\pipe\") || raw.starts_with(r"\\?\pipe\") {
+        raw.to_string()
+    } else {
+        format!(r"\\.\pipe\{raw}")
+    }
 }
 
 pub fn format_remaining(remaining: i64, threshold: i64) -> String {
@@ -118,6 +237,28 @@ pub fn format_remaining(remaining: i64, threshold: i64) -> String {
         format!("{}:{:02}", remaining / 60, remaining % 60)
     } else {
         format!("{}m", remaining / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use super::pipe_name_str;
+
+    #[cfg(windows)]
+    #[test]
+    fn prepends_pipe_prefix_to_a_filesystem_path() {
+        assert_eq!(
+            pipe_name_str(r"C:\Users\me\AppData\Roaming\herdr\herdr.sock"),
+            r"\\.\pipe\C:\Users\me\AppData\Roaming\herdr\herdr.sock",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn leaves_an_existing_pipe_path_untouched() {
+        assert_eq!(pipe_name_str(r"\\.\pipe\herdr"), r"\\.\pipe\herdr");
+        assert_eq!(pipe_name_str(r"\\?\pipe\herdr"), r"\\?\pipe\herdr");
     }
 }
 

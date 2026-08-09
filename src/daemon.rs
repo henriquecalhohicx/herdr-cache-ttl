@@ -8,6 +8,7 @@ use crate::state::{State, TimerEntry};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+#[cfg(unix)]
 extern "C" fn on_signal(_: libc::c_int) {
     RUNNING.store(false, Ordering::Relaxed);
 }
@@ -32,6 +33,14 @@ pub fn run(cfg: &Config) -> io::Result<()> {
     fs::write(&cfg.pid_file, format!("{}", std::process::id()))?;
     let _pid = PidGuard(cfg.pid_file.clone());
 
+    // Windows: no replacement handler is registered here. `herdr pane close`
+    // sends no signal on Windows at all (confirmed independently in the
+    // `herdr-notes` fork's Gotchas — "kills the process with no signal"), so
+    // a graceful-shutdown handler would never fire from herdr's own teardown
+    // path in practice; a `Stop-Process`-style hard kill can't be caught
+    // either way. The `RUNNING` flag and pid-file guard below don't depend
+    // on this handler existing.
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
@@ -63,7 +72,7 @@ pub fn run(cfg: &Config) -> io::Result<()> {
 
         let now = crate::now_unix();
 
-        if tick_count % cleanup_interval == 0 {
+        if tick_count.is_multiple_of(cleanup_interval) {
             prune_stale(&st);
             timers = st.read_timers();
             if timers.is_empty() {
@@ -188,14 +197,89 @@ fn is_running(pid_file: &std::path::Path) -> bool {
     let Ok(pid) = data.trim().parse::<i32>() else {
         return false;
     };
+    if pid <= 0 {
+        return false;
+    }
+    pid_alive(pid)
+}
+
+/// Unix: signal 0 performs no delivery, existence check only.
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: kill signal 0 is a liveness probe only.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Windows: open the process and confirm it hasn't exited. `OpenProcess`
+/// succeeding is not by itself proof of liveness (a pid can be reused, or
+/// the handle can briefly outlive process exit), so this also checks
+/// `GetExitCodeProcess` returns `STILL_ACTIVE` — the same two-step check
+/// `herdr-pc-ram-and-cpu-usage-overlay`'s `pid_alive` already uses.
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: handle checked before use; code is caller-owned; handle closed
+    // exactly once.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid as u32);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
 fn logf(msg: &str) {
-    let (h, m, s) = unsafe {
+    let (h, m, s) = local_time_hms();
+    eprintln!("[{h:02}:{m:02}:{s:02}] {msg}");
+}
+
+/// Unix: `localtime` fills a caller-owned `tm`.
+#[cfg(unix)]
+fn local_time_hms() -> (i32, i32, i32) {
+    // SAFETY: `localtime` fills the caller-owned `tm`; `t` is a valid time_t.
+    unsafe {
         let t = libc::time(std::ptr::null_mut());
         let tm = libc::localtime(&t);
         ((*tm).tm_hour, (*tm).tm_min, (*tm).tm_sec)
-    };
-    eprintln!("[{h:02}:{m:02}:{s:02}] {msg}");
+    }
+}
+
+/// Windows counterpart, sourced from `GetLocalTime` instead of `localtime` —
+/// the exact technique `herdr-pc-ram-and-cpu-usage-overlay`'s
+/// `render.rs::local_time_string` already uses.
+#[cfg(windows)]
+fn local_time_hms() -> (i32, i32, i32) {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: `GetLocalTime` fills the caller-owned `SYSTEMTIME`.
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    (st.wHour as i32, st.wMinute as i32, st.wSecond as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_running_false_for_a_missing_pid_file() {
+        let path =
+            std::env::temp_dir().join(format!("cache-ttl-no-such-pid-{}", std::process::id()));
+        assert!(!is_running(&path));
+    }
+
+    #[test]
+    fn is_running_true_for_the_current_process() {
+        let path = std::env::temp_dir().join(format!("cache-ttl-self-pid-{}", std::process::id()));
+        std::fs::write(&path, format!("{}", std::process::id())).unwrap();
+        assert!(is_running(&path));
+        let _ = std::fs::remove_file(&path);
+    }
 }

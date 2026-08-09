@@ -82,8 +82,8 @@ pub fn show_timers(cfg: &Config) -> io::Result<()> {
     let mut ids: Vec<&String> = timers.keys().collect();
     ids.sort();
 
-    println!("{:<12}  {:<8}  {}", "PANE", "TTL", "TITLE");
-    println!("{:<12}  {:<8}  {}", "----", "---", "-----");
+    println!("{:<12}  {:<8}  TITLE", "PANE", "TTL");
+    println!("{:<12}  {:<8}  -----", "----", "---");
 
     for pane_id in ids {
         let entry = &timers[pane_id];
@@ -110,7 +110,8 @@ pub fn toggle_sort(cfg: &Config) -> io::Result<()> {
     let sort_file = cfg.state_dir.join("sort_active");
 
     if sort_file.exists() {
-        let msg = r#"{"id":"off","method":"agent.view.clear","params":{"source":"plugin:cache-ttl"}}"#;
+        let msg =
+            r#"{"id":"off","method":"agent.view.clear","params":{"source":"plugin:cache-ttl"}}"#;
         herdr::socket_send(&socket, msg)
             .map_err(|e| io::Error::new(e.kind(), format!("failed to clear sort view: {e}")))?;
         let _ = fs::remove_file(&sort_file);

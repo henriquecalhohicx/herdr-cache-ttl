@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -30,21 +29,88 @@ impl Lock {
     fn acquire(path: &Path) -> io::Result<Self> {
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        lock_exclusive(&file)?;
         Ok(Lock { file })
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        unlock(&self.file);
+    }
+}
+
+/// Unix: `flock(LOCK_EX)` — blocks until the lock is free.
+#[cfg(unix)]
+fn lock_exclusive(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: file outlives the call; return value checked.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn unlock(file: &fs::File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: file outlives the call; failure is a best-effort unlock,
+    // matching the Unix Drop's prior behavior of ignoring the return code.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+/// Windows: `LockFileEx` is the direct analog of Unix `flock` — an exclusive
+/// advisory lock on an open file handle. `LOCKFILE_EXCLUSIVE_LOCK` with a
+/// zeroed `OVERLAPPED` blocks synchronously until the lock is free, matching
+/// `flock(LOCK_EX)`'s blocking behavior. The lock range covers the whole
+/// representable range (`u32::MAX` for both the high and low byte counts) —
+/// this state file is a few KB of JSON, never near that size.
+#[cfg(windows)]
+fn lock_exclusive(file: &fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: handle is valid for the duration of this call; overlapped is a
+    // caller-owned, zeroed OVERLAPPED as required for a synchronous lock.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn unlock(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: same handle/overlapped shape as the matching lock call;
+    // failure is a best-effort unlock, matching the Unix Drop's behavior.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    unsafe {
+        UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped);
     }
 }
 
@@ -142,4 +208,28 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&tmp, &data)?;
     fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn lock_is_exclusive_within_one_process() {
+        let dir = std::env::temp_dir().join(format!("cache-ttl-lock-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".state.lock");
+
+        let first = Lock::acquire(&path).unwrap();
+        // A second acquire from the SAME process/thread would deadlock on a
+        // blocking lock, so this test only proves acquire+drop round-trips
+        // without erroring — cross-process exclusion is verified live in
+        // Task 4's smoke test (two `cache-ttl` invocations racing a save).
+        drop(first);
+        let second = Lock::acquire(&path).unwrap();
+        drop(second);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

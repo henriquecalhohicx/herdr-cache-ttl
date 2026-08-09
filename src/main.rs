@@ -13,19 +13,6 @@ pub fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-#[cfg(test)]
-mod tests {
-    use super::now_unix;
-
-    #[test]
-    fn now_unix_is_a_plausible_unix_timestamp() {
-        // 2020-01-01T00:00:00Z .. 2100-01-01T00:00:00Z, sanity-bounding
-        // against a platform time source that returned garbage.
-        let t = now_unix();
-        assert!(t > 1_577_836_800 && t < 4_102_444_800, "got {t}");
-    }
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -58,5 +45,18 @@ fn main() {
     if let Err(e) = result {
         eprintln!("{e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::now_unix;
+
+    #[test]
+    fn now_unix_is_a_plausible_unix_timestamp() {
+        // 2020-01-01T00:00:00Z .. 2100-01-01T00:00:00Z, sanity-bounding
+        // against a platform time source that returned garbage.
+        let t = now_unix();
+        assert!(t > 1_577_836_800 && t < 4_102_444_800, "got {t}");
     }
 }
