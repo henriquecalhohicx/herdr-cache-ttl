@@ -223,9 +223,11 @@ mod tests {
 
         let first = Lock::acquire(&path).unwrap();
         // A second acquire from the SAME process/thread would deadlock on a
-        // blocking lock, so this test only proves acquire+drop round-trips
-        // without erroring — cross-process exclusion is verified live in
-        // Task 4's smoke test (two `cache-ttl` invocations racing a save).
+        // blocking lock, so this test only proves the Windows
+        // `LockFileEx`/`UnlockFileEx` pair (and the Unix `flock` pair)
+        // round-trips without erroring in a single process. Cross-process
+        // contention — two `cache-ttl` invocations racing a save — is NOT
+        // verified live; that remains a known gap (see CLAUDE.md).
         drop(first);
         let second = Lock::acquire(&path).unwrap();
         drop(second);
