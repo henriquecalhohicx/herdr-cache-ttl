@@ -156,6 +156,12 @@ pub fn socket_send(socket_path: &str, msg: &str) -> io::Result<()> {
 /// it never reads a response — so this is a plain `CreateFileW` + one
 /// `WriteFile`, with the same `ERROR_PIPE_BUSY` retry the overlay fork's
 /// richer transport uses for its connect path.
+///
+/// Known limitation: unlike the Unix path's `set_write_timeout(2s)`, this
+/// `WriteFile` has no timeout — a stalled reader on the herdr side could
+/// block `reapply_sort` indefinitely at daemon startup. A real timeout needs
+/// overlapped I/O, which is a bigger change than this pass should attempt;
+/// tracked as a known gap in CLAUDE.md.
 #[cfg(windows)]
 pub fn socket_send(socket_path: &str, msg: &str) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_WRITE, INVALID_HANDLE_VALUE};
@@ -209,6 +215,14 @@ pub fn socket_send(socket_path: &str, msg: &str) -> io::Result<()> {
     unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
     if ok == 0 {
         Err(io::Error::last_os_error())
+    } else if written as usize != bytes.len() {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "partial named-pipe write: wrote {written} of {} bytes",
+                bytes.len()
+            ),
+        ))
     } else {
         Ok(())
     }
