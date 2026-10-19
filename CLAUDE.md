@@ -181,8 +181,10 @@ does, coloured per account. Not in upstream.
   Runs every tick, before the empty-timers early exit, so the badge stays
   while a pane is `working` (when the countdown tokens are cleared).
 - **Sidebar:** `%APPDATA%\herdr\config.toml` `[ui.sidebar.agents]` renders
-  `$acct_c1`/`$acct_c2`/`$acct_c3` before the countdown, in the statusline's
-  colours (green `#00d700`, red `#ff5f5f`, blue `#0087ff`). A 4th+ account
+  `$acct_c1`/`$acct_c2`/`$acct_c3` before the countdown, in softened
+  versions of the statusline's green/red/blue (`#55b44a`, `#d67278`,
+  `#4a8cd8`, not bold — the statusline's pure 256-colour shades were too
+  loud next to the countdown colours). A 4th+ account
   emits a token but needs its own row entry to show.
 - Verified live 2026-10-19: all 10 open Claude panes tagged, matching a
   manual transcript lookup (4 c1, 3 c2, 3 c3).
