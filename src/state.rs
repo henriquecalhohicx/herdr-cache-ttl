@@ -147,13 +147,6 @@ impl State {
         read_json(&self.notified_path).unwrap_or_default()
     }
 
-    pub fn set_timer(&self, pane_id: &str, entry: TimerEntry) -> io::Result<()> {
-        let _lock = self.lock()?;
-        let mut t: Timers = read_json(&self.timers_path).unwrap_or_default();
-        t.insert(pane_id.into(), entry);
-        atomic_write_json(&self.timers_path, &t)
-    }
-
     pub fn clear_all_timers(&self) -> io::Result<()> {
         let _lock = self.lock()?;
         atomic_write_json(&self.timers_path, &Timers::new())

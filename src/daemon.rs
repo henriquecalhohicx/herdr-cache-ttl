@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, fs, io, thread, time::Duration};
 
+use crate::account;
 use crate::config::Config;
 use crate::herdr;
-use crate::state::{State, TimerEntry};
+use crate::state::{State, Timers};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -71,6 +72,11 @@ pub fn run(cfg: &Config) -> io::Result<()> {
     // interval and its separate 60s backoff step.
     const MAX_CONSECUTIVE_FAILURES: u32 = 10;
 
+    // session id -> account number. Only hits are cached: a brand-new
+    // session's transcript may not exist on disk yet, so a miss is retried
+    // on the next tick.
+    let mut accounts: HashMap<String, u32> = HashMap::new();
+
     while RUNNING.load(Ordering::Relaxed) {
         thread::sleep(tick_dur);
         if !RUNNING.load(Ordering::Relaxed) {
@@ -78,6 +84,10 @@ pub fn run(cfg: &Config) -> io::Result<()> {
         }
 
         tick_count += 1;
+
+        // Runs before the empty-timers early exit: the account badge shows
+        // on every Claude pane, counting down or not.
+        refresh_accounts(&mut accounts);
 
         let mut timers = st.read_timers();
         if timers.is_empty() {
@@ -94,7 +104,7 @@ pub fn run(cfg: &Config) -> io::Result<()> {
             }
         }
 
-        if refresh_working(&st, cfg, now) {
+        if clear_working(&st, cfg) {
             timers = st.read_timers();
         }
 
@@ -139,31 +149,83 @@ pub fn run(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-fn refresh_working(st: &State, cfg: &Config, now: i64) -> bool {
+/// Working panes are guaranteed cache-fresh (see `handlers::turn_action_for`,
+/// which clears a pane's timer/tokens the moment it starts working) — so
+/// this is a catch-all safety net, not the primary mechanism, covering only
+/// the case where that transition event was missed (e.g. daemon restarted
+/// mid-turn). Panes already cleared (no timer entry) are left alone so the
+/// tick loop doesn't spam redundant clear calls every 15s.
+fn panes_needing_clear(agents: &[herdr::AgentInfo], timers: &Timers) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|a| a.agent_status == "working" && timers.contains_key(&a.pane_id))
+        .map(|a| a.pane_id.clone())
+        .collect()
+}
+
+fn clear_working(st: &State, cfg: &Config) -> bool {
     let Ok(agents) = herdr::agent_list() else {
         return false;
     };
 
     let timers = st.read_timers();
-    let mut changed = false;
+    let to_clear = panes_needing_clear(&agents, &timers);
+    if to_clear.is_empty() {
+        return false;
+    }
+    for pane_id in &to_clear {
+        let _ = st.delete_timer_and_notification(pane_id);
+        let _ = herdr::clear_pane_tokens(pane_id, cfg);
+    }
+    true
+}
 
-    for agent in &agents {
-        if agent.agent_status != "working" {
+/// Tags each Claude pane with its account badge (`acct_cN`, see
+/// `herdr::set_account_token`). The tokens carry no TTL, so a pane whose
+/// tokens already show the right account is skipped — herdr is only called
+/// when a pane is new or its session switched account.
+fn refresh_accounts(cache: &mut HashMap<String, u32>) {
+    let Some(home) = account::home_dir() else {
+        return;
+    };
+    let Ok(agents) = herdr::agent_list() else {
+        return;
+    };
+    for a in &agents {
+        let Some(session_id) = a.agent_session.as_ref().map(|s| s.value.as_str()) else {
+            continue;
+        };
+        if a.agent != "claude" || session_id.is_empty() {
             continue;
         }
-        let last = timers.get(&agent.pane_id).map_or(0, |e| e.last_turn);
-        if now - last > cfg.tick_interval {
-            let _ = st.set_timer(
-                &agent.pane_id,
-                TimerEntry {
-                    last_turn: now,
-                    ttl_seconds: cfg.ttl_seconds,
-                },
-            );
-            changed = true;
+        let account = match cache.get(session_id) {
+            Some(&n) => n,
+            None => {
+                let Some(n) = account::find_account(&home, session_id) else {
+                    continue;
+                };
+                cache.insert(session_id.to_string(), n);
+                n
+            }
+        };
+        if !account_tokens_match(&a.tokens, account) {
+            if let Err(e) = herdr::set_account_token(&a.pane_id, account) {
+                logf(&format!("account badge for {} failed: {e}", a.pane_id));
+            }
         }
     }
-    changed
+}
+
+/// True when `tokens` holds exactly this account's badge and no other's.
+fn account_tokens_match(tokens: &HashMap<String, String>, account: u32) -> bool {
+    account::accounts().all(|n| {
+        let value = tokens.get(&account::token_name(n));
+        if n == account {
+            value.is_some_and(|v| *v == format!("c{n}"))
+        } else {
+            value.is_none()
+        }
+    })
 }
 
 fn prune_stale(st: &State) {
@@ -324,6 +386,7 @@ fn local_time_hms() -> (i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::TimerEntry;
 
     #[test]
     fn is_running_false_for_a_missing_pid_file() {
@@ -369,5 +432,70 @@ mod tests {
         assert!(is_cache_ttl_image(r"C:\Plugins\Cache-Ttl.EXE"));
         assert!(!is_cache_ttl_image(r"C:\Windows\System32\notepad.exe"));
         assert!(!is_cache_ttl_image(""));
+    }
+
+    fn agent(pane_id: &str, agent_status: &str) -> herdr::AgentInfo {
+        herdr::AgentInfo {
+            pane_id: pane_id.to_string(),
+            agent: "claude".to_string(),
+            agent_status: agent_status.to_string(),
+            terminal_title_stripped: String::new(),
+            agent_session: None,
+            tokens: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn account_tokens_match_only_the_exact_badge() {
+        let tokens = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert!(account_tokens_match(&tokens(&[("acct_c2", "c2")]), 2));
+        assert!(account_tokens_match(
+            &tokens(&[("acct_c2", "c2"), ("cache_ok", "56m")]),
+            2
+        ));
+        assert!(!account_tokens_match(&tokens(&[]), 2));
+        assert!(!account_tokens_match(&tokens(&[("acct_c1", "c1")]), 2));
+        assert!(!account_tokens_match(
+            &tokens(&[("acct_c1", "c1"), ("acct_c2", "c2")]),
+            2
+        ));
+    }
+
+    fn timer() -> TimerEntry {
+        TimerEntry {
+            last_turn: 0,
+            ttl_seconds: 3600,
+        }
+    }
+
+    #[test]
+    fn selects_only_working_panes_that_still_carry_a_timer() {
+        let agents = vec![
+            agent("w1:p1", "working"), // tracked + working -> needs clearing
+            agent("w1:p2", "idle"),    // tracked but idle -> leave it counting down
+            agent("w1:p3", "working"), // working but never had a timer -> nothing to clear
+        ];
+        let mut timers: Timers = Timers::new();
+        timers.insert("w1:p1".into(), timer());
+        timers.insert("w1:p2".into(), timer());
+
+        assert_eq!(
+            panes_needing_clear(&agents, &timers),
+            vec!["w1:p1".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_working_panes_means_nothing_to_clear() {
+        let agents = vec![agent("w1:p1", "idle"), agent("w1:p2", "done")];
+        let mut timers: Timers = Timers::new();
+        timers.insert("w1:p1".into(), timer());
+
+        assert!(panes_needing_clear(&agents, &timers).is_empty());
     }
 }

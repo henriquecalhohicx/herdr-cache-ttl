@@ -124,6 +124,69 @@ countdown per agent pane).
   at daemon startup. Fixing this needs overlapped I/O; deferred as
   out-of-scope for a cheap fix.
 
+## Behavior change (2026-08-15) — no countdown while working
+
+Previously, `daemon.rs::refresh_working` reset a working pane's timer to full
+`ttl_seconds` on every tick (~15s) for as long as `agent_status` stayed
+`"working"`, and `handlers.rs::status_change` reset to full on *any* status
+transition. Net effect: any actively-worked pane showed a static, near-full
+countdown (e.g. `60m`) the entire time it was working — cosmetically
+confusing next to herdr's own `working` status icon, since the two signals
+said the same thing twice, one of them looking broken.
+
+Changed to: a `"working"` pane shows **no cache badge at all** (all
+`cache_ok`/`cache_warn`/`cache_crit`/`cache_sort` tokens cleared, timer
+entry deleted) — `handlers.rs::status_change` now branches on
+`turn_action_for(agent_status)`: `"working"` clears, anything else starts a
+fresh countdown from that transition. `daemon.rs::refresh_working` was
+renamed `clear_working` and repurposed as a safety net (sweeps any
+currently-working pane whose tokens/timer weren't already cleared, e.g. if
+the daemon restarted mid-turn) rather than the primary mechanism. This
+diverges from upstream `nytafar/herdr-cache-ttl`, which does not have this
+distinction.
+
+**Gotcha — restarting the daemon after a rebuild.** `herdr plugin disable
+<id>` / `enable <id>` does **not** re-run `[[startup]]` on this herdr
+version (confirmed empirically: the daemon process stayed dead through a
+disable/enable cycle, while one-shot `[[events]]`/`[[actions]]` invocations
+kept working fine throughout — those are spawned per-call with full env
+regardless of daemon state). `[[startup]]` only appears to fire on
+herdr-server start. To pick up a rebuilt binary without restarting the
+whole herdr session: stop the old process, then launch the new exe's
+`daemon` subcommand directly with its required env vars set by hand —
+`HERDR_PLUGIN_STATE_DIR` (`%LOCALAPPDATA%\herdr\plugins\cache-ttl`),
+`HERDR_PLUGIN_CONFIG_DIR` (`herdr plugin config-dir cache-ttl`), and
+optionally `HERDR_BIN_PATH` (`(Get-Command herdr).Source`) so
+`herdr_bin()` doesn't fall back to a bare-name PATH lookup. `daemon.pid`
+self-heals on the next successful start (see `pid_alive`'s image-name
+check), so the stale pid left behind by a hard `Stop-Process` doesn't need
+manual cleanup.
+
+## Feature (2026-10-19) — Claude account badge
+
+The daemon also tags every Claude pane with the Claude Code account it runs
+under, as one of `acct_c1`/`acct_c2`/.../`acct_c9` (value `c1`, `c2`, ...),
+so the sidebar row can show the same `cN` badge the Claude Code statusline
+does, coloured per account. Not in upstream.
+
+- **Resolution:** herdr's `agent list` gives each pane's
+  `agent_session.value` (session id) but not its config dir.
+  `account::find_account` looks for `<id>.jsonl` under
+  `~\.claude*\projects\*\` — `.claude` -> 1, `.claudeN` -> N. Only hits
+  are cached (per session id, in-memory); a new session whose transcript
+  doesn't exist yet is retried next tick.
+- **Reporting:** separate metadata source `plugin:cache-ttl-account`, no
+  `--ttl-ms` (a no-TTL token persists — verified live), and only re-sent
+  when the pane's current tokens don't already show exactly that account.
+  Runs every tick, before the empty-timers early exit, so the badge stays
+  while a pane is `working` (when the countdown tokens are cleared).
+- **Sidebar:** `%APPDATA%\herdr\config.toml` `[ui.sidebar.agents]` renders
+  `$acct_c1`/`$acct_c2`/`$acct_c3` before the countdown, in the statusline's
+  colours (green `#00d700`, red `#ff5f5f`, blue `#0087ff`). A 4th+ account
+  emits a token but needs its own row entry to show.
+- Verified live 2026-10-19: all 10 open Claude panes tagged, matching a
+  manual transcript lookup (4 c1, 3 c2, 3 c3).
+
 ## Layout
 
 - `src/state.rs` — timer/notification persistence + cross-process file
@@ -136,3 +199,5 @@ countdown per agent pane).
 - `src/handlers.rs` — one-shot CLI subcommands invoked by manifest
   actions/events.
 - `src/config.rs` — env-var + optional JSON overlay config.
+- `src/account.rs` — session id -> Claude Code account number lookup for
+  the `acct_cN` badge.

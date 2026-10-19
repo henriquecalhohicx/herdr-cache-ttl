@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io;
 #[cfg(unix)]
 use std::io::Write;
@@ -27,9 +28,61 @@ fn herdr_bin() -> &'static str {
 pub struct AgentInfo {
     pub pane_id: String,
     #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
     pub agent_status: String,
     #[serde(default)]
     pub terminal_title_stripped: String,
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct AgentSession {
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Account badge tokens live under their own metadata source, reported
+/// without a TTL: the account never changes for a session, so they are
+/// written once per (pane, session) instead of every tick, and a separate
+/// source keeps them independent of the countdown tokens' 45s TTL.
+pub const ACCOUNT_SOURCE: &str = "plugin:cache-ttl-account";
+
+/// One token per account (`acct_c1` = `c1`, ...) so the sidebar row can give
+/// each its own colour; the other account tokens are cleared in the same call.
+pub fn set_account_token(pane_id: &str, account: u32) -> io::Result<()> {
+    let name = crate::account::token_name(account);
+    let token = format!("{name}=c{account}");
+    let others: Vec<String> = crate::account::accounts()
+        .filter(|&n| n != account)
+        .map(crate::account::token_name)
+        .collect();
+    let mut args = vec![
+        "pane",
+        "report-metadata",
+        pane_id,
+        "--source",
+        ACCOUNT_SOURCE,
+        "--token",
+        &token,
+    ];
+    for other in &others {
+        args.extend(["--clear-token", other]);
+    }
+
+    let out = Command::new(herdr_bin()).args(&args).output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(io::Error::other(format!(
+            "{} pane report-metadata (account) failed: {}",
+            herdr_bin(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
 }
 
 pub fn set_pane_tokens(pane_id: &str, remaining: i64, cfg: &Config) -> io::Result<()> {
@@ -92,6 +145,35 @@ pub fn set_pane_tokens(pane_id: &str, remaining: i64, cfg: &Config) -> io::Resul
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(io::Error::other(format!(
             "{} pane report-metadata failed: {}",
+            herdr_bin(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+pub fn clear_pane_tokens(pane_id: &str, cfg: &Config) -> io::Result<()> {
+    let out = Command::new(herdr_bin())
+        .args([
+            "pane",
+            "report-metadata",
+            pane_id,
+            "--source",
+            cfg.metadata_source,
+            "--clear-token",
+            "cache_ok",
+            "--clear-token",
+            "cache_warn",
+            "--clear-token",
+            "cache_crit",
+            "--clear-token",
+            "cache_sort",
+        ])
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(io::Error::other(format!(
+            "{} pane report-metadata (clear) failed: {}",
             herdr_bin(),
             stderr.trim()
         )));

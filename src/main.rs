@@ -1,3 +1,4 @@
+mod account;
 mod config;
 mod daemon;
 mod handlers;

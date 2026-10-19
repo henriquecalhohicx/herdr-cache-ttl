@@ -5,6 +5,24 @@ use crate::config::Config;
 use crate::herdr;
 use crate::state::{State, TimerEntry};
 
+/// A pane's cache badge is only informative while the agent isn't actively
+/// working: `"working"` is guaranteed cache-fresh (any real turn just
+/// happened or is about to), so showing a countdown there is noise, not
+/// signal. The countdown only means something once the agent stops and the
+/// cache actually starts aging.
+enum TurnAction {
+    Clear,
+    StartCountdown,
+}
+
+fn turn_action_for(agent_status: &str) -> TurnAction {
+    if agent_status == "working" {
+        TurnAction::Clear
+    } else {
+        TurnAction::StartCountdown
+    }
+}
+
 pub fn status_change(cfg: &Config) -> io::Result<()> {
     let Some(event_json) = nonempty_var("HERDR_PLUGIN_EVENT_JSON") else {
         return Ok(());
@@ -32,13 +50,19 @@ pub fn status_change(cfg: &Config) -> io::Result<()> {
 
     let st = State::new(cfg);
     st.init()?;
-    st.set_timer_and_clear_notification(
-        &event.data.pane_id,
-        TimerEntry {
-            last_turn: crate::now_unix(),
-            ttl_seconds: cfg.ttl_seconds,
-        },
-    )
+    match turn_action_for(&event.data.agent_status) {
+        TurnAction::Clear => {
+            st.delete_timer_and_notification(&event.data.pane_id)?;
+            herdr::clear_pane_tokens(&event.data.pane_id, cfg)
+        }
+        TurnAction::StartCountdown => st.set_timer_and_clear_notification(
+            &event.data.pane_id,
+            TimerEntry {
+                last_turn: crate::now_unix(),
+                ttl_seconds: cfg.ttl_seconds,
+            },
+        ),
+    }
 }
 
 pub fn pane_closed(cfg: &Config) -> io::Result<()> {
@@ -158,4 +182,30 @@ struct PaneData {
 #[derive(Deserialize)]
 struct ContextJson {
     focused_pane_agent: Option<String>,
+}
+
+#[cfg(test)]
+mod turn_action_tests {
+    use super::*;
+
+    #[test]
+    fn working_status_clears_instead_of_starting_a_countdown() {
+        assert!(matches!(turn_action_for("working"), TurnAction::Clear));
+    }
+
+    #[test]
+    fn non_working_statuses_start_a_countdown() {
+        assert!(matches!(
+            turn_action_for("idle"),
+            TurnAction::StartCountdown
+        ));
+        assert!(matches!(
+            turn_action_for("done"),
+            TurnAction::StartCountdown
+        ));
+        assert!(matches!(
+            turn_action_for("needs-attention"),
+            TurnAction::StartCountdown
+        ));
+    }
 }
